@@ -161,6 +161,36 @@ describe("workspace-files-panel upload review", () => {
 });
 
 describe("workspace-files-panel file tree boundary", () => {
+  it("collapses and expands the file tree while keeping the file viewer available", async () => {
+    const panel = new WorkspaceFilesPanel();
+    panel.context = workspacePanelContext({ fileTree: [fileEntry("README.md", 4096)] });
+    document.body.append(panel);
+    await panel.updateComplete;
+
+    const toggle = requiredElement(panel.shadowRoot?.querySelector<HTMLButtonElement>(".file-tree-toggle"), "file tree toggle");
+    const tree = requiredElement(panel.shadowRoot?.querySelector<HTMLElement>("#workspace-file-tree"), "file tree");
+
+    expect(toggle.getAttribute("aria-expanded")).toBe("true");
+    expect(toggle.getAttribute("aria-controls")).toBe(tree.id);
+    expect(tree.hidden).toBe(false);
+    expect(panel.shadowRoot?.querySelector("workspace-file-viewer")).not.toBeNull();
+
+    toggle.click();
+    await panel.updateComplete;
+
+    expect(toggle.getAttribute("aria-expanded")).toBe("false");
+    expect(toggle.getAttribute("aria-label")).toBe("Expand files");
+    expect(tree.hidden).toBe(true);
+    expect(panel.shadowRoot?.querySelector("workspace-file-viewer")).not.toBeNull();
+
+    toggle.click();
+    await panel.updateComplete;
+
+    expect(toggle.getAttribute("aria-expanded")).toBe("true");
+    expect(toggle.getAttribute("aria-label")).toBe("Collapse files");
+    expect(tree.hidden).toBe(false);
+  });
+
   it("renders expanded tree and selected-file state while wiring row clicks", () => {
     const onExpandDir = vi.fn<WorkspacePanelContext["onExpandDir"]>();
     const onSelectFile = vi.fn<WorkspacePanelContext["onSelectFile"]>();

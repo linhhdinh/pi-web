@@ -31,6 +31,7 @@ export class WorkspaceFilesPanel extends LitElement {
   @state() private createDirs = true;
   @state() private formError = "";
   @state() private dragActive = false;
+  @state() private fileTreeExpanded = true;
   private dragDepth = 0;
   private uploadModalRegistration: RenderedModalRegistration | undefined;
 
@@ -61,7 +62,17 @@ export class WorkspaceFilesPanel extends LitElement {
         @drop=${this.handleDrop}
       >
         <section class="toolbar">
-          <strong>Files</strong>
+          <button
+            class="file-tree-toggle"
+            title=${this.fileTreeExpanded ? "Collapse files" : "Expand files"}
+            aria-label=${this.fileTreeExpanded ? "Collapse files" : "Expand files"}
+            aria-expanded=${String(this.fileTreeExpanded)}
+            aria-controls="workspace-file-tree"
+            @click=${this.toggleFileTree}
+          >
+            <strong>Files</strong>
+            <span aria-hidden="true">${this.fileTreeExpanded ? "▾" : "▸"}</span>
+          </button>
           ${context.fileTreeStale ? html`<span class="stale">stale</span>` : null}
           <div class="toolbar-actions">
             <button @click=${this.openFilePicker}>Upload</button>
@@ -70,8 +81,8 @@ export class WorkspaceFilesPanel extends LitElement {
           <input id="workspace-upload-input" class="visually-hidden" type="file" multiple @change=${this.handleFileInputChange} />
         </section>
         ${this.renderUploadProgress(context)}
-        <section class="split">
-          <div class="list tree">
+        <section class=${this.fileTreeExpanded ? "split" : "split file-tree-collapsed"}>
+          <div id="workspace-file-tree" class="list tree" ?hidden=${!this.fileTreeExpanded}>
             ${context.fileTree.length === 0 ? html`<p class="muted">No files loaded.</p>` : context.fileTree.map((entry) => this.renderTreeEntry(context, entry, 0))}
           </div>
           <div class="viewer">
@@ -218,6 +229,10 @@ export class WorkspaceFilesPanel extends LitElement {
     this.uploadInput?.click();
   };
 
+  private readonly toggleFileTree = (): void => {
+    this.fileTreeExpanded = !this.fileTreeExpanded;
+  };
+
   private readonly handleFileInputChange = (event: Event): void => {
     const input = event.currentTarget instanceof HTMLInputElement ? event.currentTarget : undefined;
     const files = fileListToArray(input?.files);
@@ -360,6 +375,10 @@ export class WorkspaceFilesPanel extends LitElement {
       :host { flex: 1 1 auto; }
       workspace-file-viewer { flex: 1 1 auto; min-height: 0; }
       .files-panel { position: relative; flex: 1 1 auto; min-height: 0; display: flex; flex-direction: column; }
+      .toolbar .file-tree-toggle { margin-left: 0; border: 0; background: transparent; padding: 4px 2px; }
+      .file-tree-toggle:hover { background: var(--pi-surface-hover); }
+      .file-tree-collapsed { grid-template-rows: minmax(0, 1fr); }
+      .tree[hidden] { display: none; }
       .toolbar-actions { display: flex; align-items: center; gap: 8px; margin-left: auto; }
       .toolbar .toolbar-actions button { margin-left: 0; }
       .visually-hidden { position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px; overflow: hidden; clip: rect(0 0 0 0); clip-path: inset(50%); white-space: nowrap; border: 0; }

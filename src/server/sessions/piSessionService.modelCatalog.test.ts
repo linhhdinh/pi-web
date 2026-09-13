@@ -2,7 +2,7 @@ import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { InMemoryCredentialStore } from "@earendil-works/pi-ai";
-import { ModelRuntime, SessionManager } from "@earendil-works/pi-coding-agent";
+import { ModelRuntime, ProjectTrustStore, SessionManager } from "@earendil-works/pi-coding-agent";
 import { afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import { PiSessionService } from "./piSessionService.js";
 import { CapturingSessionEventHub, sessionGateway } from "./piSessionService.testSupport.js";
@@ -87,6 +87,51 @@ async function expectPersistedEnabledModels(agentDir: string, expected: string[]
 
 const catalogIds = (catalog: readonly { provider: string; id: string }[]): string[] => catalog.map((entry) => `${entry.provider}/${entry.id}`);
 
+describe("PiSessionService global startup defaults", () => {
+  it("persists each pin globally, preserves external edits, and leaves current session state unchanged", async () => {
+    const { service, ref, agentDir } = await startSessionWithSettings({ defaultProvider: PROVIDER, defaultModel: DEFAULT_MODEL, defaultThinkingLevel: "low" });
+    try {
+      const before = await service.status(ref);
+      const messages = await service.messages(ref);
+      await mkdir(join(ref.cwd, ".pi"), { recursive: true });
+      await writeFile(join(ref.cwd, ".pi", "settings.json"), JSON.stringify({ defaultModel: "project-model", defaultThinkingLevel: "off" }));
+      expect(await service.getSessionDefaults(ref)).toEqual({ defaultProvider: PROVIDER, defaultModel: DEFAULT_MODEL, defaultThinkingLevel: "low" });
+      expect(await service.setSessionDefaults(ref, { provider: PROVIDER, modelId: FIRST_MODEL })).toEqual({ defaultProvider: PROVIDER, defaultModel: FIRST_MODEL, defaultThinkingLevel: "low" });
+      const path = join(agentDir, "settings.json");
+      const persisted: unknown = JSON.parse(await readFile(path, "utf8"));
+      if (!isRecord(persisted)) throw new Error("Expected persisted settings object");
+      await writeFile(path, JSON.stringify({ ...persisted, defaultModel: DEFAULT_MODEL, customSetting: "external edit" }));
+      expect(await service.setSessionDefaults(ref, { thinkingLevel: "max" })).toEqual({ defaultProvider: PROVIDER, defaultModel: DEFAULT_MODEL, defaultThinkingLevel: "max" });
+      expect(JSON.parse(await readFile(path, "utf8"))).toMatchObject({ defaultThinkingLevel: "max", customSetting: "external edit" });
+      expect(JSON.parse(await readFile(join(ref.cwd, ".pi", "settings.json"), "utf8"))).toEqual({ defaultModel: "project-model", defaultThinkingLevel: "off" });
+      const after = await service.status(ref);
+      expect(after.model).toEqual(before.model);
+      expect(after.thinkingLevel).toEqual(before.thinkingLevel);
+      expect(await service.messages(ref)).toEqual(messages);
+    } finally {
+      await service.dispose();
+    }
+  });
+
+  it("rejects disabled/unavailable models and malformed settings without overwriting them", async () => {
+    const { service, ref, agentDir } = await startSessionWithSettings({ enabledModels: [`${PROVIDER}/${DEFAULT_MODEL}`] });
+    try {
+      const path = join(agentDir, "settings.json");
+      const before = await readFile(path, "utf8");
+      await expect(service.setSessionDefaults(ref, { provider: PROVIDER, modelId: FIRST_MODEL })).rejects.toThrow("not enabled");
+      await expect(service.setSessionDefaults(ref, { provider: PROVIDER, modelId: "missing" })).rejects.toThrow("Model not found");
+      await expect(service.setSessionDefaults(ref, { provider: PROVIDER })).rejects.toThrow("both");
+      expect(await readFile(path, "utf8")).toBe(before);
+      await writeFile(path, "{malformed");
+      await expect(service.getSessionDefaults(ref)).rejects.toThrow("settings failed");
+      await expect(service.setSessionDefaults(ref, { thinkingLevel: "high" })).rejects.toThrow("settings failed");
+      expect(await readFile(path, "utf8")).toBe("{malformed");
+    } finally {
+      await service.dispose();
+    }
+  });
+});
+
 describe("PiSessionService model catalog", () => {
   it("marks every available model enabled in catalog order when no scope is configured", async () => {
     const { service, ref } = await startSessionWithSettings(undefined);
@@ -142,6 +187,95 @@ describe("PiSessionService model catalog", () => {
       await expectPersistedEnabledModels(agentDir, remainingIds);
       // The live scope follows immediately: the pickable models exclude the disabled one.
       expect(catalogIds((await service.availableModels(ref)).map((model) => ({ provider: model.provider ?? "", id: model.id ?? "" })))).toEqual(remainingIds);
+    } finally {
+      await service.dispose();
+    }
+  });
+
+  it("lazily projects a scope change into another active session", async () => {
+    const root = await mkdtemp(join(tmpdir(), "pi-web-model-scope-sync-"));
+    tempDirs.push(root);
+    const agentDir = join(root, "agent");
+    const workspace = join(root, "workspace");
+    await mkdir(agentDir, { recursive: true });
+    await mkdir(workspace, { recursive: true });
+    await writeFile(join(agentDir, "settings.json"), JSON.stringify({ enabledModels: [`${PROVIDER}/${FIRST_MODEL}`] }));
+
+    const hub = new CapturingSessionEventHub();
+    const gateway = sessionGateway([]);
+    gateway.create = (cwd) => SessionManager.inMemory(cwd);
+    const service = new PiSessionService(hub, {
+      agentDir,
+      modelRuntime,
+      sessionManager: gateway,
+      heartbeatIntervalMs: 60_000,
+    });
+    try {
+      const first = await service.start(workspace);
+      const second = await service.start(workspace);
+      const secondRef = { id: second.id, cwd: workspace };
+      const before = await service.availableModels(secondRef);
+      expect(catalogIds(before.map((model) => ({ provider: model.provider ?? "", id: model.id ?? "" })))).toEqual([`${PROVIDER}/${FIRST_MODEL}`]);
+
+      const target = modelRuntime.getAvailableSnapshot().find((model) => model.id !== FIRST_MODEL);
+      if (target === undefined) throw new Error("expected a second available model");
+      await service.setModelEnabled({ id: first.id, cwd: workspace }, target.provider, target.id, true);
+
+      expect(catalogIds((await service.availableModels(secondRef)).map((model) => ({ provider: model.provider ?? "", id: model.id ?? "" })))).toEqual([
+        `${PROVIDER}/${FIRST_MODEL}`,
+        `${target.provider}/${target.id}`,
+      ]);
+      expect((await service.modelCatalog(secondRef)).find((entry) => entry.provider === target.provider && entry.id === target.id)?.enabled).toBe(true);
+      expect(hub.globalEvents).toContainEqual({ type: "models.changed", revision: 1 });
+    } finally {
+      await service.dispose();
+    }
+  });
+
+  it("keeps a workspace enabled-model override isolated from global edits", async () => {
+    const root = await mkdtemp(join(tmpdir(), "pi-web-model-scope-domains-"));
+    tempDirs.push(root);
+    const agentDir = join(root, "agent");
+    const workspaceA = join(root, "workspace-a");
+    const workspaceB = join(root, "workspace-b");
+    await mkdir(agentDir, { recursive: true });
+    await mkdir(join(workspaceA, ".pi"), { recursive: true });
+    await mkdir(workspaceB, { recursive: true });
+    await writeFile(join(agentDir, "settings.json"), JSON.stringify({ enabledModels: [`${PROVIDER}/${FIRST_MODEL}`] }));
+    await writeFile(join(workspaceA, ".pi", "settings.json"), JSON.stringify({ enabledModels: [`${PROVIDER}/${FIRST_MODEL}`, `${PROVIDER}/${DEFAULT_MODEL}`] }));
+    new ProjectTrustStore(agentDir).set(workspaceA, true);
+
+    const hub = new CapturingSessionEventHub();
+    const gateway = sessionGateway([]);
+    gateway.create = (cwd) => SessionManager.inMemory(cwd);
+    const service = new PiSessionService(hub, {
+      agentDir,
+      modelRuntime,
+      sessionManager: gateway,
+      heartbeatIntervalMs: 60_000,
+    });
+    try {
+      const globalSession = await service.start(workspaceB);
+      const projectSession = await service.start(workspaceA);
+      const projectRef = { id: projectSession.id, cwd: workspaceA };
+      const globalRef = { id: globalSession.id, cwd: workspaceB };
+      expect(catalogIds((await service.availableModels(globalRef)).map((model) => ({ provider: model.provider ?? "", id: model.id ?? "" })))).toEqual([`${PROVIDER}/${FIRST_MODEL}`]);
+      const projectIds = catalogIds((await service.availableModels(projectRef)).map((model) => ({ provider: model.provider ?? "", id: model.id ?? "" })));
+      expect(projectIds).toEqual([`${PROVIDER}/${FIRST_MODEL}`, `${PROVIDER}/${DEFAULT_MODEL}`]);
+
+      const target = modelRuntime.getAvailableSnapshot().find((model) => !projectIds.includes(`${model.provider}/${model.id}`));
+      if (target === undefined) throw new Error("expected a model outside the project override");
+      await service.setModelEnabled(globalRef, target.provider, target.id, true);
+
+      expect(catalogIds((await service.availableModels(globalRef)).map((model) => ({ provider: model.provider ?? "", id: model.id ?? "" })))).toEqual([
+        `${PROVIDER}/${FIRST_MODEL}`,
+        `${target.provider}/${target.id}`,
+      ]);
+      expect(catalogIds((await service.availableModels(projectRef)).map((model) => ({ provider: model.provider ?? "", id: model.id ?? "" })))).toEqual(projectIds);
+      expect((await service.modelCatalog(projectRef)).every((entry) => entry.editable === false)).toBe(true);
+      expect((await service.modelCatalog(globalRef)).every((entry) => entry.editable !== false)).toBe(true);
+      await expect(service.setModelScope(projectRef, "all")).rejects.toThrow("workspace's .pi/settings.json");
+      expect(hub.globalEvents).toContainEqual({ type: "models.changed", revision: 1 });
     } finally {
       await service.dispose();
     }

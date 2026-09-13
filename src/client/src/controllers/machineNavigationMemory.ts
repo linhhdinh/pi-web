@@ -1,11 +1,14 @@
 import type { AppState } from "../appState";
 import { LOCAL_MACHINE_ID } from "../machineKeys";
+import { normalizeContributionQueryRecord, type ContributionQueryRecord } from "../namespacedQueryArgs";
 import type { AppRoute } from "../route";
 import { browserSessionStorage, PersistentValueMap, type KeyValueStorage } from "./sessionStorageMemory";
 
+const LEGACY_FILES_QUERY_PARAMETER = "core.workspace.files--file";
+const LEGACY_TERMINAL_QUERY_PARAMETER = "core.workspace.terminal--terminal";
+
 export interface WorkspaceRouteSurface {
-  selectedFilePath?: string | undefined;
-  selectedTerminalId?: string | undefined;
+  contributionQuery?: ContributionQueryRecord | undefined;
 }
 
 export interface MachineNavigationSnapshot {
@@ -68,18 +71,22 @@ export function emptyMachineNavigationSnapshot(machineId: string): MachineNaviga
   return { machineId, surface: {} };
 }
 
-export function machineNavigationSnapshotFromState(state: AppState): MachineNavigationSnapshot {
+export function machineNavigationSnapshotFromState(
+  state: AppState,
+  contributionQuery: Readonly<ContributionQueryRecord> = {},
+): MachineNavigationSnapshot {
   const hasWorkspace = state.selectedWorkspace !== undefined;
+  const boundedQuery = hasWorkspace ? normalizeContributionQueryRecord(contributionQuery) : {};
+  const selectedSessionId = isClientPendingSession(state.selectedSession) ? undefined : state.selectedSession?.id;
   return {
     machineId: state.selectedMachine?.id ?? LOCAL_MACHINE_ID,
     projectId: state.selectedProject?.id,
     workspaceId: state.selectedWorkspace?.id,
-    sessionId: state.selectedSession?.id,
+    sessionId: selectedSessionId,
     tool: state.workspaceTool,
     view: state.mainView,
     surface: {
-      selectedFilePath: hasWorkspace ? state.selectedFilePath : undefined,
-      selectedTerminalId: hasWorkspace ? state.selectedTerminalId : undefined,
+      ...(Object.keys(boundedQuery).length === 0 ? {} : { contributionQuery: boundedQuery }),
     },
   };
 }
@@ -95,10 +102,18 @@ export function routeFromMachineNavigationSnapshot(snapshot: MachineNavigationSn
   };
 }
 
+function isClientPendingSession(session: AppState["selectedSession"]): boolean {
+  return session !== undefined && Reflect.get(session, "clientPendingStart") === true;
+}
+
 function cloneSnapshot(snapshot: MachineNavigationSnapshot): MachineNavigationSnapshot {
+  const contributionQuery = snapshot.surface.contributionQuery;
   return {
     ...snapshot,
-    surface: { ...snapshot.surface },
+    surface: {
+      ...snapshot.surface,
+      ...(contributionQuery === undefined ? {} : { contributionQuery: normalizeContributionQueryRecord(contributionQuery) }),
+    },
   };
 }
 
@@ -121,9 +136,16 @@ function parseMachineNavigationSnapshot(value: unknown): MachineNavigationSnapsh
 
 function parseWorkspaceRouteSurface(value: unknown): WorkspaceRouteSurface {
   if (!isRecord(value)) return {};
+  const storedContributionQuery = isRecord(value["contributionQuery"]) ? value["contributionQuery"] : {};
+  const legacySelectedFilePath = optionalStringField(value, "selectedFilePath");
+  const legacySelectedTerminalId = optionalStringField(value, "selectedTerminalId");
+  const contributionQuery = normalizeContributionQueryRecord({
+    ...(legacySelectedFilePath === undefined ? {} : { [LEGACY_FILES_QUERY_PARAMETER]: legacySelectedFilePath }),
+    ...(legacySelectedTerminalId === undefined ? {} : { [LEGACY_TERMINAL_QUERY_PARAMETER]: legacySelectedTerminalId }),
+    ...storedContributionQuery,
+  });
   return {
-    selectedFilePath: optionalStringField(value, "selectedFilePath"),
-    selectedTerminalId: optionalStringField(value, "selectedTerminalId"),
+    ...(Object.keys(contributionQuery).length === 0 ? {} : { contributionQuery }),
   };
 }
 

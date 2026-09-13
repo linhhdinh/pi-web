@@ -27,6 +27,29 @@ function browserClipboardTextWriteHost(): ClipboardTextWriteHost {
     : { isSecureContext: browserIsSecureContext(), writeText, fallbackWriteText };
 }
 
+export interface ClipboardTextReadHost {
+  readonly isSecureContext: boolean;
+  readonly readText?: (() => Promise<string>) | undefined;
+}
+
+export async function readClipboardText(host: ClipboardTextReadHost = browserClipboardTextReadHost()): Promise<string | undefined> {
+  if (!host.isSecureContext || host.readText === undefined) return undefined;
+  try {
+    return await host.readText();
+  } catch {
+    return undefined;
+  }
+}
+
+function browserClipboardTextReadHost(): ClipboardTextReadHost {
+  return { isSecureContext: browserIsSecureContext(), readText: browserClipboardReadText() };
+}
+
+function browserClipboardReadText(): (() => Promise<string>) | undefined {
+  if (typeof navigator === "undefined" || !("clipboard" in navigator) || typeof navigator.clipboard.readText !== "function") return undefined;
+  return navigator.clipboard.readText.bind(navigator.clipboard);
+}
+
 function browserIsSecureContext(): boolean {
   return typeof window !== "undefined" && window.isSecureContext;
 }

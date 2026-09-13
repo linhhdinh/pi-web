@@ -5,7 +5,7 @@ import { Terminal, type ITerminalOptions, type ITheme } from "@xterm/xterm";
 import { FitAddon, type ITerminalDimensions } from "@xterm/addon-fit";
 import "@xterm/xterm/css/xterm.css";
 import { terminalSocket, terminalsApi, type TerminalCommandRun, type TerminalInfo, type Workspace } from "../api";
-import { writeClipboardText } from "../clipboard";
+import { readClipboardText, writeClipboardText } from "../clipboard";
 import { selectFallbackTerminal, selectPreferredTerminal } from "../controllers/terminalSelection";
 import { createTerminalCopySnapshot, DEFAULT_TERMINAL_ANSI_THEME, type TerminalCopyRunStyle, type TerminalCopySnapshot } from "../terminalCopySnapshot";
 import { createTerminalSoftKeysDefaultEnvironmentMedia, hasTerminalSoftKeysPreference, initialTerminalSoftKeysEnabled, isTerminalSoftKeysDefaultEnvironment, writeTerminalSoftKeysPreference } from "../terminalSoftKeysPreference";
@@ -32,6 +32,7 @@ export class TerminalPanel extends LitElement {
   @query(".terminal-host") private terminalHost?: HTMLDivElement | null;
   @query(".terminal-copy-content") private terminalCopyContent?: HTMLPreElement | null;
   @query(".terminal-copy-selector") private terminalCopySelector?: HTMLTextAreaElement | null;
+  @query(".manual-paste-input") private manualPasteInput?: HTMLTextAreaElement | null;
   @state() private terminals: TerminalInfo[] = [];
   @state() private commandRuns: TerminalCommandRun[] = [];
   @state() private selectedId: string | undefined;
@@ -44,6 +45,8 @@ export class TerminalPanel extends LitElement {
   @state() private softKeysEnabled = initialTerminalSoftKeysEnabled();
   @state() private copySnapshot: TerminalCopySnapshot | undefined;
   @state() private copyStatus: string | undefined;
+  @state() private pastingClipboard = false;
+  @state() private manualPasteOpen = false;
 
   private terminal: Terminal | undefined;
   private fitAddon: FitAddon | undefined;
@@ -439,6 +442,7 @@ export class TerminalPanel extends LitElement {
     this.fitAddon = undefined;
     this.copySnapshot = undefined;
     this.copyStatus = undefined;
+    this.manualPasteOpen = false;
   }
 
   private renderCommandRunNotice() {
@@ -621,6 +625,89 @@ export class TerminalPanel extends LitElement {
     this.scheduleFitAndNotify();
   }
 
+  private renderPasteButton() {
+    if (!this.shouldShowSoftKeysToggle()) return null;
+    const pasting = this.pastingClipboard;
+    return html`
+      <button
+        type="button"
+        class="paste-button"
+        title="Paste from the clipboard into the shell"
+        aria-label="Paste from the clipboard into the shell"
+        ?disabled=${pasting}
+        @click=${() => { void this.pasteFromClipboard(); }}
+      >
+        <span>${pasting ? "Pasting…" : "Paste"}</span>
+      </button>
+    `;
+  }
+
+  private async pasteFromClipboard(): Promise<void> {
+    if (!this.selectedTerminalAcceptsInput() || this.pastingClipboard) return;
+    this.pastingClipboard = true;
+    this.error = undefined;
+    try {
+      const text = await readClipboardText();
+      if (text !== undefined && text !== "") {
+        this.sendTerminalInput(text);
+        this.focusTerminal();
+        return;
+      }
+      this.openManualPaste();
+    } finally {
+      this.pastingClipboard = false;
+    }
+  }
+
+  private openManualPaste(): void {
+    if (!this.selectedTerminalAcceptsInput()) return;
+    this.manualPasteOpen = true;
+    void this.updateComplete.then(() => { this.manualPasteInput?.focus(); });
+  }
+
+  private closeManualPaste(): void {
+    this.manualPasteOpen = false;
+    this.error = undefined;
+    this.focusTerminal();
+  }
+
+  private sendManualPaste(): void {
+    const text = this.manualPasteInput?.value ?? "";
+    if (text === "") {
+      this.error = "Nothing to send — long-press the box, paste, then tap Send.";
+      this.manualPasteInput?.focus();
+      return;
+    }
+    this.manualPasteOpen = false;
+    this.error = undefined;
+    this.sendTerminalInput(text);
+    this.focusTerminal();
+  }
+
+  private renderManualPasteSheet() {
+    if (!this.manualPasteOpen || !this.selectedTerminalAcceptsInput()) return null;
+    return html`
+      <section class="manual-paste-sheet" aria-label="Paste into the shell">
+        <p>Long-press the box and paste, then tap Send. (Direct clipboard read is blocked on this connection.)</p>
+        <textarea
+          class="manual-paste-input"
+          rows="4"
+          wrap="soft"
+          spellcheck="false"
+          autocapitalize="off"
+          autocomplete="off"
+          enterkeyhint="done"
+          aria-label="Text to paste into the shell"
+          placeholder="Long-press here → Paste"
+        ></textarea>
+        <div class="manual-paste-actions">
+          <button type="button" @click=${() => { this.closeManualPaste(); }}>Cancel</button>
+          <button type="button" class="selected" @click=${() => { this.sendManualPaste(); }}>Send to shell</button>
+        </div>
+      </section>
+    `;
+  }
+
   private renderSoftKeysToggle() {
     if (!this.shouldShowSoftKeysToggle()) return null;
     return html`
@@ -657,6 +744,7 @@ export class TerminalPanel extends LitElement {
         <div class="terminal-tabs">
           ${this.renderCopyModeToggle()}
           ${this.renderSoftKeysToggle()}
+          ${this.renderPasteButton()}
           ${this.terminals.map((terminal) => html`
             <button class=${this.selectedId === terminal.id ? "selected" : ""} @click=${() => { this.selectTerminal(terminal.id); }}>
               <span>${terminal.name}${terminal.exited ? " · exited" : ""}</span>
@@ -672,6 +760,7 @@ export class TerminalPanel extends LitElement {
         <div class="terminal-stage">
           <div class=${this.copySnapshot === undefined ? "terminal-host" : "terminal-host copying"} ?inert=${this.copySnapshot !== undefined}></div>
           ${this.renderCopyMode()}
+          ${this.renderManualPasteSheet()}
         </div>
       </section>
     `;
@@ -683,16 +772,17 @@ export class TerminalPanel extends LitElement {
     .terminal-tabs { flex: 0 0 auto; display: flex; gap: 6px; align-items: center; padding: 6px; border-bottom: 1px solid var(--pi-border-muted); background: var(--pi-bg); overflow: auto; }
     .terminal-tabs > button { box-sizing: border-box; height: 30px; line-height: 16px; }
     /* Desktop xterm already has mouse selection and hardware keys; keep touch controls to touch/narrow layouts. */
-    .copy-mode-toggle, .soft-keys-toggle, terminal-soft-keys { display: none; }
+    .copy-mode-toggle, .soft-keys-toggle, .paste-button, terminal-soft-keys { display: none; }
     .copy-mode-toggle.selected { display: inline-flex; }
     @media (pointer: coarse), (max-width: 760px) {
-      .copy-mode-toggle, .soft-keys-toggle { display: inline-flex; }
+      .copy-mode-toggle, .soft-keys-toggle, .paste-button { display: inline-flex; }
       terminal-soft-keys { display: block; }
     }
     button { display: inline-flex; align-items: center; gap: 6px; min-width: 0; max-width: 180px; border: 1px solid var(--pi-border); border-radius: 7px; background: var(--pi-surface); color: var(--pi-text); padding: 5px 7px; cursor: pointer; }
     button.selected { border-color: var(--pi-accent); background: var(--pi-selection-bg); }
     button.new { flex: 0 0 auto; color: var(--pi-muted); }
     .soft-keys-toggle { flex: 0 0 auto; }
+    .paste-button { flex: 0 0 auto; }
     .soft-keys-toggle .keyboard-icon { display: block; flex: 0 0 auto; width: 16px; height: 16px; fill: none; stroke: currentColor; stroke-width: 1.8; stroke-linecap: round; stroke-linejoin: round; pointer-events: none; }
     button span { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
     button small { color: var(--pi-muted); font-size: 14px; line-height: 1; }
@@ -721,6 +811,11 @@ export class TerminalPanel extends LitElement {
     .terminal-copy-content { overflow: auto; pointer-events: none; background: var(--pi-terminal-bg); color: var(--pi-terminal-text); -webkit-user-select: none; user-select: none; }
     .terminal-copy-selector { z-index: 1; overflow: auto; resize: none; outline: none; appearance: none; background: transparent; color: transparent; caret-color: var(--pi-accent); -webkit-text-fill-color: transparent; cursor: text; -webkit-user-select: text; user-select: text; -webkit-touch-callout: default; touch-action: auto; }
     .terminal-copy-selector::selection { background: var(--pi-terminal-selection); color: transparent; -webkit-text-fill-color: transparent; }
+    .manual-paste-sheet { position: absolute; inset: auto 0 0 0; z-index: 20; display: flex; flex-direction: column; gap: 8px; padding: 10px; border-top: 1px solid var(--pi-border); background: var(--pi-surface); color: var(--pi-text); }
+    .manual-paste-sheet p { margin: 0; font-size: 12px; color: var(--pi-muted); }
+    .manual-paste-input { box-sizing: border-box; width: 100%; min-height: 88px; margin: 0; padding: 8px; border: 1px solid var(--pi-border); border-radius: 7px; background: var(--pi-bg); color: var(--pi-text); font: 13px ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; -webkit-user-select: text; user-select: text; -webkit-touch-callout: default; touch-action: auto; }
+    .manual-paste-actions { display: flex; justify-content: flex-end; gap: 8px; }
+    .manual-paste-actions button { min-height: 34px; padding: 6px 12px; }
     .terminal-host .xterm { height: 100%; cursor: text; position: relative; user-select: none; }
     .terminal-host .xterm.focus, .terminal-host .xterm:focus { outline: none; }
     .terminal-host .xterm-helpers { position: absolute; top: 0; z-index: 5; }
